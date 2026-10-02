@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install --quiet pytest numpy
+      - name: tests (2-4 CPU processes; every strategy against torch DDP / single-process training, bit for bit)
+        run: PYTHONPATH=.:tests python -m pytest -q tests
+      - name: the benchmark script, end to end on CPU
+        run: python bench/run.py verify --device cpu --out /tmp/verify.jsonl
