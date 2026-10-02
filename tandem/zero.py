@@ -18,6 +18,8 @@ Stages 1 and 2 keep all parameters as views into one flat buffer, divided
 into one contiguous shard per rank; stage 3 does the same per unit. The
 optimizer (ShardedAdamW) only ever sees a rank's shards."""
 
+import warnings
+
 import torch
 from torch.autograd import Variable
 
@@ -193,6 +195,10 @@ class FSDP(torch.nn.Module):
         self.module, self.g = model, group
         self.opt = optimizer or ShardedAdamW()
         self.prefetch = prefetch
+        # The embedding's input (token ids) needs no gradient; torch warns
+        # that its backward hook then fires on the outputs, which is the
+        # moment we want.
+        warnings.filterwarnings("ignore", message="Full backward hook is firing when gradients are computed with respect to module outputs")
         self.live = 0  # units whose full parameters exist right now
         self.max_live = 0
         mods = model.units()

@@ -2,17 +2,20 @@
 
 Each ordered pair of ranks (src, dst) has a mailbox: `slots` buffers of
 `slot_bytes` each, allocated by src (in shared memory for CPU ranks, or on
-src's GPU and shared through CUDA IPC), and two counters in a shared control
-block: messages src has published and messages dst has consumed. A message
-larger than a slot travels as a sequence of pieces.
+src's GPU and shared through CUDA IPC), and two counting semaphores: pieces
+waiting to be read, and slots free to write. A message larger than a slot
+travels as a sequence of pieces.
 
-  put (src):  wait for a free slot (published - consumed < slots), copy the
-              piece in, finish the copy, then publish.
-  take (dst): wait until a piece is published, copy (or add) it out of the
-              slot into the destination, finish the copy, then consume.
+  put (src):  take a free slot, copy the piece in, finish the copy (on a
+              GPU, synchronize the stream), then signal a piece.
+  take (dst): take a piece, copy (or add) it out of the slot, finish the
+              copy, then signal a free slot.
 
-A counter has one writer, and a writer completes its data copy before it
-writes the counter, so a reader that sees the counter sees the data. The
+A waiting thread sleeps in the kernel, without Python's global lock, so a
+collective in flight never slows the training thread down (an earlier
+version polled counters from Python, and on 2 T4s its communication took
+5x longer while backward ran beside it). Semaphores also order memory: what
+was written before a signal is visible after the wait. The
 collectives are built from these two operations: ring reduce-scatter and
 all-gather (so all-reduce), a pipelined broadcast, and point-to-point
 send/recv for pipeline parallelism.
@@ -39,21 +42,6 @@ DEFAULT_TIMEOUT = float(os.environ.get("TANDEM_TIMEOUT", "600"))
 
 class CommError(RuntimeError):
     pass
-
-
-def _spin(cond, timeout, what):
-    """Waits until cond() holds: busy at first, then yielding the CPU (and the
-    GIL) between checks so the training thread keeps running."""
-    if cond():
-        return
-    t0 = time.monotonic()
-    n = 0
-    while not cond():
-        n += 1
-        if n > 100:
-            time.sleep(2e-5)
-        if n % 2048 == 0 and time.monotonic() - t0 > timeout:
-            raise CommError(f"timed out after {timeout:.0f}s waiting for {what}")
 
 
 class Work:
@@ -85,16 +73,18 @@ class Group:
     """One rank's view of the group: its mailboxes, the control block, and
     the thread that runs its collectives."""
 
-    def __init__(self, rank, size, device, ctrl, queues, slot_bytes=DEFAULT_SLOT_BYTES,
+    def __init__(self, rank, size, device, sync, queues, slot_bytes=DEFAULT_SLOT_BYTES,
                  slots=DEFAULT_SLOTS, timeout=DEFAULT_TIMEOUT):
         self.rank, self.size = rank, size
         self.device = torch.device(device)
         self.slot_bytes, self.slots, self.timeout = slot_bytes, slots, timeout
-        self._ctrl_t = ctrl  # keeps the shared memory alive
-        self.ctrl = ctrl.numpy()
+        self._full, self._free, self._barrier = sync
         self._queues = queues
         self.out = {}  # dst -> [slots, slot_bytes] uint8, ours
         self.inbox = {}  # src -> [slots, slot_bytes] uint8, theirs
+        self._sent = {q: 0 for q in range(size)}  # pieces sent to q
+        self._got = {q: 0 for q in range(size)}  # pieces taken from q
+        self._scratch = None  # for adding a piece that lives on another GPU
         self.trace = []  # (name, start, end, bytes) of each collective, host clock
         self.waits = []  # (name, start, end): time a caller spent blocked on a collective
         self.tracing = False
@@ -105,19 +95,20 @@ class Group:
         self._thread.start()
         self.barrier()
 
-    # ---- control block layout: published[src, dst], consumed[src, dst], barrier[rank]
-    def _pub(self, src, dst):
-        return src * self.size + dst
-
-    def _con(self, src, dst):
-        return self.size * self.size + src * self.size + dst
-
-    def _bar(self, rank):
-        return 2 * self.size * self.size + rank
+    def _sem(self, sems, src, dst):
+        return sems[src * self.size + dst]
 
     @staticmethod
-    def ctrl_len(size):
-        return 2 * size * size + size
+    def make_sync(ctx, size, slots):
+        """The semaphores and barrier, created by the launcher and inherited
+        by every rank."""
+        full = [ctx.Semaphore(0) for _ in range(size * size)]
+        free = [ctx.Semaphore(slots) for _ in range(size * size)]
+        return full, free, ctx.Barrier(size)
+
+    def _acquire(self, sem, what):
+        if not sem.acquire(timeout=self.timeout):
+            raise CommError(f"timed out after {self.timeout:.0f}s waiting for {what}")
 
     def _rendezvous(self):
         for dst in range(self.size):
@@ -131,6 +122,8 @@ class Group:
         while len(self.inbox) < self.size - 1:
             src, buf = self._queues[self.rank].get(timeout=self.timeout)
             self.inbox[src] = buf
+        if self.device.type == "cuda":
+            self._scratch = torch.empty(self.slot_bytes, dtype=torch.uint8, device=self.device)
 
     # ---- the communication thread
     def _loop(self):
@@ -182,31 +175,32 @@ class Group:
         return max(1, self.slot_bytes // t.element_size())
 
     def _put(self, dst, piece):
-        seq = int(self.ctrl[self._pub(self.rank, dst)])
-        con = self._con(self.rank, dst)
-        _spin(lambda: seq - self.ctrl[con] < self.slots, self.timeout, f"rank {dst} to free a slot")
+        self._acquire(self._sem(self._free, self.rank, dst), f"rank {dst} to free a slot")
+        seq = self._sent[dst]
+        self._sent[dst] = seq + 1
         nb = piece.numel() * piece.element_size()
         slot = self.out[dst][seq % self.slots, :nb]
         slot.copy_(piece.reshape(-1).view(torch.uint8), non_blocking=True)
         self._finish()
-        self.ctrl[self._pub(self.rank, dst)] = seq + 1
+        self._sem(self._full, self.rank, dst).release()
 
     def _take(self, src, into, reduce=False):
-        con = self._con(src, self.rank)
-        seq = int(self.ctrl[con])
-        pub = self._pub(src, self.rank)
-        _spin(lambda: self.ctrl[pub] > seq, self.timeout, f"a message from rank {src}")
+        self._acquire(self._sem(self._full, src, self.rank), f"a message from rank {src}")
+        seq = self._got[src]
+        self._got[src] = seq + 1
         nb = into.numel() * into.element_size()
         slot = self.inbox[src][seq % self.slots, :nb].view(into.dtype)
         if reduce:
             if slot.device == into.device:
                 into.add_(slot)
-            else:
-                into.add_(slot.to(into.device, non_blocking=True))
+            else:  # copy across GPUs first, into a reused buffer
+                tmp = self._scratch[:nb].view(into.dtype)
+                tmp.copy_(slot, non_blocking=True)
+                into.add_(tmp)
         else:
             into.copy_(slot, non_blocking=True)
         self._finish()
-        self.ctrl[con] = seq + 1
+        self._sem(self._free, src, self.rank).release()
 
     def _exchange(self, send, dst, recv, src, reduce):
         """Sends `send` to dst while receiving into `recv` from src, piece by
@@ -350,12 +344,10 @@ class Group:
 
     def barrier(self):
         def run():
-            i = self._bar(self.rank)
-            gen = int(self.ctrl[i]) + 1
-            self.ctrl[i] = gen
-            for q in range(self.size):
-                j = self._bar(q)
-                _spin(lambda: self.ctrl[j] >= gen, self.timeout, f"rank {q} at the barrier")
+            try:
+                self._barrier.wait(timeout=self.timeout)
+            except threading.BrokenBarrierError as e:
+                raise CommError("barrier broken: a rank failed or timed out") from e
 
         return self.submit("barrier", run)
 
@@ -363,20 +355,30 @@ class Group:
         if self._closed:
             return
         self.barrier()
+
+        def release():
+            # Drop our handles on the other ranks' buffers before anyone
+            # exits, so no rank frees memory another still maps.
+            self.inbox.clear()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+                torch.cuda.ipc_collect()
+
+        self.submit("release", release)
+        self.barrier()
         self._closed = True
         self._jobs.put(None)
         self._thread.join()
-        self.inbox.clear()  # release the peers' buffers before they exit
 
 
-def _worker(rank, size, fn, args, ctrl, queues, device, slot_bytes, slots, results):
+def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, results):
     if device == "cuda":
         torch.cuda.set_device(rank)
         dev = torch.device("cuda", rank)
     else:
         dev = torch.device("cpu")
         torch.set_num_threads(max(1, int(os.environ.get("TANDEM_CPU_THREADS", "1"))))
-    g = Group(rank, size, dev, ctrl, queues, slot_bytes, slots)
+    g = Group(rank, size, dev, sync, queues, slot_bytes, slots)
     try:
         out = fn(g, *args)
         g.close()
@@ -395,10 +397,10 @@ def launch(fn, size, *args, device="cpu", slot_bytes=DEFAULT_SLOT_BYTES, slots=D
     import tempfile
 
     ctx = mp.get_context("spawn")
-    ctrl = torch.zeros(Group.ctrl_len(size), dtype=torch.int64).share_memory_()
+    sync = Group.make_sync(ctx, size, slots)
     queues = [ctx.Queue() for _ in range(size)]
     with tempfile.TemporaryDirectory(prefix="tandem-") as results:
-        mp.spawn(_worker, args=(size, fn, args, ctrl, queues, device, slot_bytes, slots, results),
+        mp.spawn(_worker, args=(size, fn, args, sync, queues, device, slot_bytes, slots, results),
                  nprocs=size, join=True)
         out = []
         for r in range(size):
