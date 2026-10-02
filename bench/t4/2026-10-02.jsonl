@@ -1,0 +1,24 @@
+{"section": "verify", "model_params": 3323392, "device": "cuda", "torch": "2.10.0+cu128"}
+{"section": "verify", "strategy": "torch-fsdp", "against": "torch-ddp", "losses_equal": true, "weights_equal": true, "max_weight_diff": 0.0, "steps": 20, "final_loss": 3.616891860961914}
+{"section": "verify", "strategy": "ddp", "against": "torch-ddp", "losses_equal": true, "weights_equal": true, "max_weight_diff": 0.0, "steps": 20, "final_loss": 3.616891860961914}
+{"section": "verify", "strategy": "zero1", "against": "torch-ddp", "losses_equal": true, "weights_equal": true, "max_weight_diff": 0.0, "steps": 20, "final_loss": 3.616891860961914}
+{"section": "verify", "strategy": "zero2", "against": "torch-ddp", "losses_equal": true, "weights_equal": true, "max_weight_diff": 0.0, "steps": 20, "final_loss": 3.616891860961914}
+{"section": "verify", "strategy": "zero3", "against": "torch-ddp", "losses_equal": true, "weights_equal": true, "max_weight_diff": 0.0, "steps": 20, "final_loss": 3.616891860961914}
+{"section": "verify", "strategy": "pp-gpipe", "against": "single-process accumulation", "losses_equal": true, "weights_equal": true, "max_weight_diff": 0.0, "stage0_params": 1677824}
+{"section": "verify", "strategy": "pp-1f1b", "against": "single-process accumulation", "losses_equal": true, "weights_equal": true, "max_weight_diff": 0.0, "stage0_params": 1677824}
+{"section": "allreduce", "MB": 1, "tandem_ms": 0.9110159999181633, "nccl_ms": 0.4108215000542259, "tandem_GBps": 1.0719487913359642, "nccl_GBps": 2.377096865356608}
+{"section": "allreduce", "MB": 4, "tandem_ms": 1.5843894998397445, "nccl_ms": 1.1729304997061263, "tandem_GBps": 2.4654606713785365, "nccl_GBps": 3.3303337247847997}
+{"section": "allreduce", "MB": 16, "tandem_ms": 4.549390499960282, "nccl_ms": 4.326960000298641, "tandem_GBps": 3.434526009613027, "nccl_GBps": 3.6110802963100155}
+{"section": "allreduce", "MB": 64, "tandem_ms": 17.109143999959997, "nccl_ms": 17.069018500023958, "tandem_GBps": 3.653017357276678, "nccl_GBps": 3.661604795841792}
+{"section": "allreduce", "MB": 256, "tandem_ms": 67.25869349997993, "nccl_ms": 67.91915350004274, "tandem_GBps": 3.716991618341124, "nccl_GBps": 3.6808468173832978}
+{"section": "bench", "model": "medium", "params": 85842432, "global_batch": 16, "seq": 512, "device": "cuda"}
+{"section": "bench", "strategy": "single-gpu", "step_ms": 1280.1798394998514, "tokens_per_s": 6399.100928819893, "peak_mem_MB": [5764], "final_loss": 3.569603443145752}
+{"section": "bench", "strategy": "torch-ddp", "step_ms": 683.5661149998487, "tokens_per_s": 11984.210188654266, "peak_mem_MB": [3740, 3740], "final_loss": 3.5696035623550415}
+{"section": "bench", "strategy": "torch-fsdp", "step_ms": 700.2850394999314, "tokens_per_s": 11698.093687464536, "peak_mem_MB": [2980, 2963], "final_loss": 3.569603681564331}
+{"section": "bench", "strategy": "ddp", "step_ms": 798.0139500000405, "tokens_per_s": 10265.484707378342, "peak_mem_MB": [3775, 3775], "final_loss": 3.5696038007736206, "profile_rank0": {"step_s": 0.8032, "compute_s": 0.803, "comm_s": 0.5172, "exposed_comm_s": 0.534, "overlap": 0.0, "comm_bytes": 343369728}}
+{"section": "bench", "strategy": "ddp-nooverlap", "step_ms": 769.2476264999186, "tokens_per_s": 10649.366624988692, "peak_mem_MB": [3775, 3775], "final_loss": 3.5696033239364624, "profile_rank0": {"step_s": 0.7733, "compute_s": 0.7731, "comm_s": 0.0955, "exposed_comm_s": 0.499, "overlap": 0.0, "comm_bytes": 343369728}}
+{"section": "bench", "strategy": "zero1", "step_ms": 853.2003924999572, "tokens_per_s": 9601.495817408935, "peak_mem_MB": [3410, 3410], "final_loss": 3.569603443145752}
+{"section": "bench", "strategy": "zero2", "step_ms": 801.6995125001358, "tokens_per_s": 10218.2923555147, "peak_mem_MB": [3268, 3268], "final_loss": 3.5696035623550415}
+{"section": "bench", "strategy": "zero3", "step_ms": 792.1876490001978, "tokens_per_s": 10340.984248288823, "peak_mem_MB": [3144, 3144], "final_loss": 3.5696038007736206, "profile_rank0": {"step_s": 0.8148, "compute_s": 0.8147, "comm_s": 0.7856, "exposed_comm_s": 0.7376, "overlap": 0.0611, "comm_bytes": 1029316608}}
+{"section": "bench", "strategy": "pp-gpipe", "step_ms": 929.9694289998115, "tokens_per_s": 8808.891716806811, "peak_mem_MB": [3069, 3085], "final_loss": 3.569603681564331}
+{"section": "bench", "strategy": "pp-1f1b", "step_ms": 911.2316314999589, "tokens_per_s": 8990.030324688492, "peak_mem_MB": [2075, 1489], "final_loss": 3.569603681564331}
