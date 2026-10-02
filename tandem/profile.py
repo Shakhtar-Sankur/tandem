@@ -35,18 +35,19 @@ class Timeline:
             self.spans.append((name, t0, time.perf_counter()))
 
 
-def summarize(compute_spans, comm_spans, step_time):
-    """Communication time, and how much of it the training thread saw
-    (spent waiting rather than computing): exposed = step - compute."""
-    compute = sum(e - s for _, s, e in compute_spans)
+def summarize(compute_spans, comm_spans, waits, step_time):
+    """Communication time on the communication thread, and how much of it
+    the training thread saw: the time it spent blocked waiting for a
+    collective (exposed). overlap = the share of communication hidden
+    behind compute."""
     comm = sum(e - s for _, s, e, _ in comm_spans)
-    exposed = max(0.0, step_time - compute)
+    exposed = sum(e - s for _, s, e in waits)
     return {
         "step_s": step_time,
-        "compute_s": compute,
+        "compute_s": sum(e - s for _, s, e in compute_spans),
         "comm_s": comm,
         "exposed_comm_s": exposed,
-        "overlap": 1 - exposed / comm if comm > 0 else None,
+        "overlap": max(0.0, 1 - exposed / comm) if comm > 0 else None,
         "comm_bytes": sum(b for *_, b in comm_spans),
     }
 

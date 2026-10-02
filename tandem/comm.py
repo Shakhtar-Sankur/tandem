@@ -59,13 +59,19 @@ def _spin(cond, timeout, what):
 class Work:
     """A collective in flight on the communication thread."""
 
-    def __init__(self, name):
+    def __init__(self, name, group=None):
         self.name = name
+        self._group = group
         self._done = threading.Event()
         self._error = None
         self.result = None
 
     def wait(self):
+        g = self._group
+        if g is not None and g.tracing and not self._done.is_set():
+            t0 = time.perf_counter()
+            self._done.wait()
+            g.waits.append((self.name, t0, time.perf_counter()))
         self._done.wait()
         if self._error is not None:
             raise CommError(f"{self.name} failed") from self._error
@@ -90,6 +96,7 @@ class Group:
         self.out = {}  # dst -> [slots, slot_bytes] uint8, ours
         self.inbox = {}  # src -> [slots, slot_bytes] uint8, theirs
         self.trace = []  # (name, start, end, bytes) of each collective, host clock
+        self.waits = []  # (name, start, end): time a caller spent blocked on a collective
         self.tracing = False
         self._jobs = queue.Queue()
         self._closed = False
@@ -155,7 +162,7 @@ class Group:
         recorded where its inputs were produced) completes."""
         if self._closed:
             raise CommError("group is closed")
-        work = Work(name)
+        work = Work(name, self)
         self._jobs.put((work, fn, ready, nbytes))
         return work if async_op else work.wait()
 
