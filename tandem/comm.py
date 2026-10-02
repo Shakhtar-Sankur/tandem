@@ -247,12 +247,14 @@ class Group:
         flat = self._flat(t)
 
         def run():
+            if op == "avg":
+                # Divided before summing, as torch DDP and FSDP do: exact for
+                # a power-of-two group, and no overflow in the sum.
+                flat.div_(self.size)
             if self.size > 1:
                 chunks = self._chunks(flat, None)
                 self._ring_reduce_scatter(chunks)
                 self._ring_all_gather(chunks)
-            if op == "avg":
-                flat.div_(self.size)
             self._finish()
             return t
 
@@ -265,12 +267,12 @@ class Group:
         flat = self._flat(t)
 
         def run():
+            if op == "avg":
+                flat.div_(self.size)
             chunks = self._chunks(flat, sizes)
             if self.size > 1:
                 self._ring_reduce_scatter(chunks)
             mine = chunks[self.rank]
-            if op == "avg":
-                mine.div_(self.size)
             self._finish()
             return mine
 
