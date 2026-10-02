@@ -329,6 +329,18 @@ class Group:
 
         return self.submit(f"recv<-{src}", run, None, t.numel() * t.element_size(), async_op)
 
+    def sendrecv(self, send, dst, recv, src, async_op=False):
+        """Sends one tensor while receiving another, piece by piece in
+        lockstep (pipeline parallelism's paired transfers)."""
+        sf, rf = self._flat(send), self._flat(recv)
+
+        def run():
+            self._exchange(sf, dst, rf, src, False)
+            return recv
+
+        return self.submit(f"sendrecv->{dst}<-{src}", run, self._ready_event(send),
+                           (send.numel() + recv.numel()) * send.element_size(), async_op)
+
     def barrier(self):
         def run():
             i = self._bar(self.rank)
