@@ -22,14 +22,18 @@ synchronization. The C++ engine moves that loop out of Python and off the host:
 4. **CUDA IPC events** so that a GPU waits for its peer's copy on the GPU itself
    (`cudaStreamWaitEvent`), not through a host-side `synchronize()`.
 
-`Group(backend="cpp")` selects the C++ engine; the Python engine stays as the reference,
-and every test runs against both.
+`Group(backend="cpp")` (or `TANDEM_BACKEND=cpp`) selects the C++ engine; the Python
+engine stays as the reference, and every test runs against both.
+
+**Status:** M0, M1 and M2 are done. The collective tests, DDP, ZeRO-1/2/3 and both
+pipeline schedules pass on the C++ engine, bit-identical to PyTorch, and on CPU it runs
+a 1 MB all-reduce 1.6 to 2.2 times faster than the Python engine. M3 (CUDA) and M4 (GPU
+measurements) are next. `docs/engine-walkthrough.md` explains the code.
 
 ## Milestones
 
-Each milestone has a spec (the header, written for you), tests that define "done",
-and the C++ you will learn by writing it. Implement the bodies in `tandem/csrc/*.cpp`;
-until you do, their tests are skipped with "not implemented".
+Each milestone has a spec (its header), tests that define "done", and the C++ concepts
+it rests on (explained in `docs/engine-walkthrough.md`).
 
 ### M0: shared memory with RAII (2-3 days)
 
@@ -85,10 +89,10 @@ and send/recv over `Channel`s, on `at::Tensor` (CPU).
 NCCL, the contention test, and DDP and ZeRO-3 step times. The README gets the
 before/after table, including whatever did not improve.
 
-## How we work
+## Build and test
 
-- You write the engine (`tandem/csrc/*.cpp`, and `*.cu` in M3). I write the specs,
-  bindings, build, tests and benchmarks, and review every diff before it is pushed.
-- Ask for an explanation whenever a concept is new; that is the point of the project.
-- Build and test: `PYTHONPATH=.:tests python -m pytest -q tests/test_engine.py`.
-  The first run compiles the extension (about a minute); later runs reuse it.
+    pip install torch pytest ninja numpy
+    PYTHONPATH=.:tests python -m pytest -q tests/test_engine.py           # M0, M1
+    TANDEM_BACKEND=cpp PYTHONPATH=.:tests python -m pytest -q tests       # everything on the C++ engine
+
+The first run compiles the extension (about a minute); later runs reuse it.

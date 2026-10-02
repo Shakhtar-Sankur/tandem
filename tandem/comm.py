@@ -49,6 +49,7 @@ DEFAULT_SLOTS = 2
 DEFAULT_TIMEOUT = float(os.environ.get("TANDEM_TIMEOUT", "600"))
 DEFAULT_TRANSPORT = os.environ.get("TANDEM_TRANSPORT", "device")
 DEFAULT_PRIORITY = int(os.environ.get("TANDEM_PRIORITY", "-1"))  # lower is more urgent; 0 is normal
+DEFAULT_BACKEND = os.environ.get("TANDEM_BACKEND", "python")  # or "cpp": the C++ engine (CPU), docs/engine.md
 
 
 class CommError(RuntimeError):
@@ -80,12 +81,39 @@ class Work:
         return self._done.is_set()
 
 
+class _CppWork(Work):
+    """A collective in flight on the C++ engine's thread."""
+
+    def __init__(self, name, group, handle, result, nbytes):
+        super().__init__(name, group)
+        self._handle, self.result, self._nbytes = handle, result, nbytes
+        self._recorded = False
+
+    def wait(self):
+        g = self._group
+        t0 = time.perf_counter() if g.tracing and not self._handle.done() else None
+        try:
+            self._handle.wait()
+        except Exception as e:
+            raise CommError(f"{self.name} failed") from e
+        if t0 is not None:
+            g.waits.append((self.name, t0, time.perf_counter()))
+        if g.tracing and not self._recorded:  # steady clock == perf_counter's clock
+            g.trace.append((self.name, self._handle.started, self._handle.finished, self._nbytes))
+        self._recorded = True
+        return self.result
+
+    def is_completed(self):
+        return self._handle.done()
+
+
 class Group:
     """One rank's view of the group: its mailboxes, the control block, and
     the thread that runs its collectives."""
 
     def __init__(self, rank, size, device, sync, queues, slot_bytes=DEFAULT_SLOT_BYTES,
-                 slots=DEFAULT_SLOTS, timeout=DEFAULT_TIMEOUT, transport=None, priority=None):
+                 slots=DEFAULT_SLOTS, timeout=DEFAULT_TIMEOUT, transport=None, priority=None,
+                 backend=None, job=None):
         self.rank, self.size = rank, size
         self.device = torch.device(device)
         self.slot_bytes, self.slots, self.timeout = slot_bytes, slots, timeout
@@ -106,10 +134,39 @@ class Group:
         self.tracing = False
         self._jobs = queue.Queue()
         self._closed = False
+        self.backend = backend or DEFAULT_BACKEND
+        self._engine = None
+        if self.backend == "cpp":
+            self._start_engine(job)
+            return
+        if self.backend != "python":
+            raise CommError(f"unknown backend {self.backend}")
         self._rendezvous()
         self._thread = threading.Thread(target=self._loop, name=f"tandem-comm-{rank}", daemon=True)
         self._thread.start()
         self.barrier()
+
+    def _start_engine(self, job):
+        if self.device.type != "cpu":
+            raise CommError("the C++ engine runs on CPU tensors so far (CUDA is milestone M3)")
+        if job is None:
+            raise CommError("the C++ engine needs a job name (launch() makes one)")
+        from .engine import lib
+
+        self._engine = lib().Engine(job, self.rank, self.size, self.slots, self.slot_bytes, self.timeout)
+        self._barrier.wait(timeout=self.timeout)  # every rank has created its outgoing channels
+        self._engine.connect()
+        self.barrier()
+
+    def _cpp(self, name, start, result, nbytes, async_op):
+        if self._closed:
+            raise CommError("group is closed")
+        try:
+            handle = start()
+        except (ValueError, RuntimeError) as e:
+            raise CommError(f"{name}: {e}") from e
+        work = _CppWork(name, self, handle, result, nbytes)
+        return work if async_op else work.wait()
 
     def _sem(self, sems, src, dst):
         return sems[src * self.size + dst]
@@ -270,6 +327,9 @@ class Group:
         if op not in ("sum", "avg"):
             raise CommError(f"unknown op {op}")
         flat = self._flat(t)
+        if self._engine is not None:
+            return self._cpp("all_reduce", lambda: self._engine.all_reduce(flat, op == "avg"), t,
+                             t.numel() * t.element_size(), async_op)
 
         def run():
             if op == "avg":
@@ -290,6 +350,10 @@ class Group:
         torch.tensor_split, or of `sizes`) reduced in place; returns that view.
         The other chunks hold partial sums afterwards."""
         flat = self._flat(t)
+        if self._engine is not None:
+            mine = self._chunks(flat, sizes)[self.rank]
+            return self._cpp("reduce_scatter", lambda: self._engine.reduce_scatter(flat, list(sizes or []), op == "avg"),
+                             mine, t.numel() * t.element_size(), async_op)
 
         def run():
             if op == "avg":
@@ -306,6 +370,10 @@ class Group:
     def all_gather(self, t, sizes=None, async_op=False):
         """Each rank holds its own chunk of `t` (chunk r); fills in the rest."""
         flat = self._flat(t)
+        if self._engine is not None:
+            self._chunks(flat, sizes)
+            return self._cpp("all_gather", lambda: self._engine.all_gather(flat, list(sizes or [])), t,
+                             t.numel() * t.element_size(), async_op)
 
         def run():
             if self.size > 1:
@@ -319,6 +387,9 @@ class Group:
         """Pipelined along the ring from root: each rank forwards each piece
         as soon as it has it."""
         flat = self._flat(t)
+        if self._engine is not None:
+            return self._cpp("broadcast", lambda: self._engine.broadcast(flat, root), t,
+                             t.numel() * t.element_size(), async_op)
 
         def run():
             n = self.size
@@ -338,6 +409,9 @@ class Group:
 
     def send(self, t, dst, async_op=False):
         flat = self._flat(t)
+        if self._engine is not None:
+            return self._cpp(f"send->{dst}", lambda: self._engine.send(flat, dst), t,
+                             t.numel() * t.element_size(), async_op)
 
         def run():
             self._exchange(flat, dst, None, None, False)
@@ -347,6 +421,9 @@ class Group:
 
     def recv(self, t, src, async_op=False):
         flat = self._flat(t)
+        if self._engine is not None:
+            return self._cpp(f"recv<-{src}", lambda: self._engine.recv(flat, src), t,
+                             t.numel() * t.element_size(), async_op)
 
         def run():
             self._exchange(None, None, flat, src, False)
@@ -358,6 +435,9 @@ class Group:
         """Sends one tensor while receiving another, piece by piece in
         lockstep (pipeline parallelism's paired transfers)."""
         sf, rf = self._flat(send), self._flat(recv)
+        if self._engine is not None:
+            return self._cpp(f"sendrecv->{dst}<-{src}", lambda: self._engine.sendrecv(sf, dst, rf, src), recv,
+                             (send.numel() + recv.numel()) * send.element_size(), async_op)
 
         def run():
             self._exchange(sf, dst, rf, src, False)
@@ -367,6 +447,9 @@ class Group:
                            (send.numel() + recv.numel()) * send.element_size(), async_op)
 
     def barrier(self):
+        if self._engine is not None:
+            return self._cpp("barrier", self._engine.barrier, None, 0, False)
+
         def run():
             try:
                 self._barrier.wait(timeout=self.timeout)
@@ -379,6 +462,13 @@ class Group:
         if self._closed:
             return
         self.barrier()
+        if self._engine is not None:
+            # A rank's shared memory outlives its name and mapping for as long
+            # as a peer still maps it, so each rank simply lets go of its own.
+            self._closed = True
+            self._engine.close()
+            self._engine = None
+            return
 
         def release():
             # Every rank drops the other ranks' buffers, then, once all have,
@@ -402,14 +492,16 @@ class Group:
         self._thread.join()
 
 
-def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, transport, priority, results):
+def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, transport, priority, backend, job,
+            results):
     if device == "cuda":
         torch.cuda.set_device(rank)
         dev = torch.device("cuda", rank)
     else:
         dev = torch.device("cpu")
         torch.set_num_threads(max(1, int(os.environ.get("TANDEM_CPU_THREADS", "1"))))
-    g = Group(rank, size, dev, sync, queues, slot_bytes, slots, transport=transport, priority=priority)
+    g = Group(rank, size, dev, sync, queues, slot_bytes, slots, transport=transport, priority=priority,
+              backend=backend, job=job)
     try:
         out = fn(g, *args)
         g.close()
@@ -421,20 +513,29 @@ def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, trans
 
 
 def launch(fn, size, *args, device="cpu", slot_bytes=DEFAULT_SLOT_BYTES, slots=DEFAULT_SLOTS,
-           transport=None, priority=None):
+           transport=None, priority=None, backend=None):
     """Runs fn(group, *args) on `size` processes (one per GPU with
     device="cuda") and returns each rank's return value, in rank order.
     transport ("device" or "host") and priority (the communication
-    stream's) only matter on GPUs.
+    stream's) only matter on GPUs. backend: "python" (default) or "cpp", the
+    C++ engine (or set TANDEM_BACKEND).
     Return values travel back pickled, so keep them small (CPU tensors,
     numbers, lists)."""
     import tempfile
+    import uuid
 
+    backend = backend or DEFAULT_BACKEND
+    if backend == "cpp":
+        from .engine import lib
+
+        lib()  # build once here, not in every rank at once
+    job = uuid.uuid4().hex[:12]
     ctx = mp.get_context("spawn")
     sync = Group.make_sync(ctx, size, slots)
     queues = [ctx.Queue() for _ in range(size)]
     with tempfile.TemporaryDirectory(prefix="tandem-") as results:
-        mp.spawn(_worker, args=(size, fn, args, sync, queues, device, slot_bytes, slots, transport, priority, results),
+        mp.spawn(_worker, args=(size, fn, args, sync, queues, device, slot_bytes, slots, transport, priority,
+                                backend, job, results),
                  nprocs=size, join=True)
         out = []
         for r in range(size):

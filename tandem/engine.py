@@ -5,7 +5,7 @@ import functools
 import os
 
 _CSRC = os.path.join(os.path.dirname(__file__), "csrc")
-SOURCES = ["engine.cpp", "shm.cpp", "channel.cpp"]
+SOURCES = ["engine.cpp", "shm.cpp", "channel.cpp", "collectives.cpp"]
 
 
 @functools.cache

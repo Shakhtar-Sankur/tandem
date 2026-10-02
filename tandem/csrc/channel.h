@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "shm.h"
 
@@ -57,6 +58,12 @@ class Channel {
   // ring is empty. A message longer than capacity: std::length_error, and the
   // message stays in the channel. Waits longer than timeout_s: Timeout.
   std::size_t recv(void* out, std::size_t capacity, double timeout_s);
+
+  // Zero-copy receive: waits for the next message and returns where it lies in
+  // the slot and its length, without copying it out. The slot stays the
+  // receiver's until release() frees it; call release() exactly once per peek.
+  std::pair<const void*, std::size_t> peek(double timeout_s);
+  void release();
 
   std::size_t slots() const noexcept;
   std::size_t slot_bytes() const noexcept;

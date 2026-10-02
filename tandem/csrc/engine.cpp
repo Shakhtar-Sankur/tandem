@@ -1,5 +1,5 @@
 // Python bindings for the engine (tandem.engine.lib()). The engine itself is in
-// shm.cpp, channel.cpp and, from M2, engine/*.cpp; this file only exposes it.
+// shm.cpp, channel.cpp and collectives.cpp; this file only exposes it.
 
 #include <torch/extension.h>
 
@@ -7,11 +7,14 @@
 #include <type_traits>
 
 #include "channel.h"
+#include "collectives.h"
 #include "not_implemented.h"
 #include "shm.h"
 
 namespace py = pybind11;
 using tandem::Channel;
+using tandem::Engine;
+using tandem::Work;
 using tandem::SharedMemory;
 
 // The ownership rules in shm.h, checked when this file compiles.
@@ -90,4 +93,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         }
         return py::bytes(out.data(), n);
       }, py::arg("capacity"), py::arg("timeout") = 10.0);
+
+  py::class_<Work, std::shared_ptr<Work>>(m, "Work")
+      .def("wait", &Work::wait, py::call_guard<py::gil_scoped_release>())
+      .def("done", &Work::done)
+      .def_property_readonly("started", &Work::started)
+      .def_property_readonly("finished", &Work::finished);
+
+  py::class_<Engine>(m, "Engine")
+      .def(py::init<const std::string&, int, int, std::size_t, std::size_t, double>(), py::arg("job"),
+           py::arg("rank"), py::arg("size"), py::arg("slots"), py::arg("slot_bytes"), py::arg("timeout"))
+      .def("connect", &Engine::connect, py::call_guard<py::gil_scoped_release>())
+      .def("close", &Engine::close, py::call_guard<py::gil_scoped_release>())
+      .def("all_reduce", &Engine::all_reduce, py::arg("t"), py::arg("average"))
+      .def("reduce_scatter", &Engine::reduce_scatter, py::arg("t"), py::arg("sizes"), py::arg("average"))
+      .def("all_gather", &Engine::all_gather, py::arg("t"), py::arg("sizes"))
+      .def("broadcast", &Engine::broadcast, py::arg("t"), py::arg("root"))
+      .def("send", &Engine::send, py::arg("t"), py::arg("dst"))
+      .def("recv", &Engine::recv, py::arg("t"), py::arg("src"))
+      .def("sendrecv", &Engine::sendrecv, py::arg("send"), py::arg("dst"), py::arg("recv"), py::arg("src"))
+      .def("barrier", &Engine::barrier);
 }
