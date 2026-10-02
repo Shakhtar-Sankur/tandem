@@ -99,4 +99,6 @@ tandem/pipeline.py  GPipe and 1F1B
 tandem/profile.py   timelines, exposed communication, Chrome traces
 tandem/model.py     the GPT used in tests and benchmarks
 bench/run.py        verification and benchmarks against torch.distributed
+tandem/csrc/        the C++ engine, in progress: see docs/engine.md
+tandem/engine.py    builds and loads it
 ```
