@@ -4,11 +4,14 @@
              weights against torch DDP (and torch FSDP), bit for bit; the
              pipeline against one process accumulating gradients.
   allreduce  tandem's ring all-reduce against NCCL (gloo on CPU), by size.
+  contention a 64 MB all-reduce alone and while the GPU runs matmuls, for
+             each transport and stream priority: whether communication
+             keeps its speed beside compute, which is what overlap needs.
   bench      a larger GPT: step time, tokens/s and peak memory per GPU for
              each strategy, and how much of tandem DDP's communication
-             hides behind backward.
+             hides behind backward. "ddp@host" is ddp over the host transport.
 
-usage: python bench/run.py [verify|allreduce|bench|all] [--device cuda|cpu]
+usage: python bench/run.py [verify|allreduce|contention|bench|all] [--device cuda|cpu]
        [--out results.jsonl]. Prints one JSON line per measurement.
 """
 
@@ -154,9 +157,10 @@ def tandem_rank(g, strategy, cfg, steps, batch, micro, deterministic, data, want
 
 
 def run_tandem(strategy, device, **kw):
+    strategy, _, transport = strategy.partition("@")
     return launch(tandem_rank, 2, strategy, kw["cfg"], kw["steps"], kw["batch"], kw.get("micro", 4),
                   kw.get("deterministic", False), kw.get("data", "synthetic"), kw.get("want_weights", False),
-                  kw.get("profile", False), device=device)
+                  kw.get("profile", False), device=device, transport=transport or None)
 
 
 # ---------------------------------------------------------------- torch.distributed
@@ -339,6 +343,67 @@ def allreduce(device):
               "tandem_GBps": mb / 1024 / ours[mb], f"{base}_GBps": mb / 1024 / ref[mb]})
 
 
+def contention_rank(g, mb, reps, gemms):
+    """A 64 MB all-reduce's own time (on the communication thread, from
+    when its input is ready): alone, then while the default stream runs
+    `gemms` 4096x4096 matmuls that it does not depend on."""
+    dev = setup(g.device.type, g.rank, False)
+    x = torch.ones(mb * (1 << 20) // 4, device=dev)
+    a = torch.randn(4096, 4096, device=dev)
+    g.all_reduce(x)
+    a @ a
+    sync(dev)
+
+    def once(busy):
+        g.barrier()
+        x.fill_(1.0)
+        g.trace.clear()
+        g.tracing = True
+        t = time.perf_counter()
+        w = g.all_reduce(x, async_op=True)  # input ready now, before the matmuls
+        for _ in range(gemms if busy else 0):
+            a @ a
+        w.wait()
+        sync(dev)
+        total = time.perf_counter() - t
+        g.tracing = False
+        _, s, e, _ = g.trace[-1]
+        assert torch.equal(x, torch.full_like(x, 2.0)), "wrong all-reduce result"
+        return e - s, total
+
+    def gemm_alone():
+        sync(dev)
+        t = time.perf_counter()
+        for _ in range(gemms):
+            a @ a
+        sync(dev)
+        return time.perf_counter() - t
+
+    alone = statistics.median(once(False)[0] for _ in range(reps))
+    busy = [once(True) for _ in range(reps)]
+    return {"comm_alone_ms": alone * 1e3, "comm_busy_ms": statistics.median(c for c, _ in busy) * 1e3,
+            "gemms_ms": statistics.median(gemm_alone() for _ in range(reps)) * 1e3,
+            "gemms_plus_comm_ms": statistics.median(t for _, t in busy) * 1e3}
+
+
+def contention(device):
+    if device != "cuda":
+        return
+    emit({"section": "contention", "p2p": torch.cuda.can_device_access_peer(0, 1),
+          "gpu": torch.cuda.get_device_name(0)})
+    for transport in ("device", "host"):
+        for priority in (0, -1):
+            try:
+                r = launch(contention_rank, 2, 64, 5, 16, device=device, transport=transport, priority=priority)[0]
+                row = {"section": "contention", "transport": transport, "priority": priority}
+                row.update({k: round(v, 2) for k, v in r.items()})
+                row["slowdown"] = round(r["comm_busy_ms"] / r["comm_alone_ms"], 2)
+                emit(row)
+            except Exception as e:
+                emit({"section": "contention", "transport": transport, "priority": priority,
+                      "error": repr(e)[:300]})
+
+
 def bench(device, preset, steps, batch):
     cfg = Config.preset(preset)
     tokens = batch * cfg.seq
@@ -362,10 +427,13 @@ def bench(device, preset, steps, batch):
             report(s, run_torch(s, device, cfg, steps, batch, data="shakespeare"))
         except Exception as e:
             emit({"section": "bench", "strategy": s, "error": repr(e)[:300]})
-    for s in ("ddp", "ddp-nooverlap", "zero1", "zero2", "zero3", "pp-gpipe", "pp-1f1b"):
+    strategies = ["ddp", "ddp-nooverlap", "zero1", "zero2", "zero3", "pp-gpipe", "pp-1f1b"]
+    if device == "cuda":
+        strategies += ["ddp@host", "zero3@host"]
+    for s in strategies:
         try:
             report(s, run_tandem(s, device, cfg=cfg, steps=steps, batch=batch, micro=4, data="shakespeare",
-                                 profile=s in ("ddp", "ddp-nooverlap", "zero3")))
+                                 profile=s.split("@")[0] in ("ddp", "ddp-nooverlap", "zero3")))
         except Exception as e:
             emit({"section": "bench", "strategy": s, "error": repr(e)[:300]})
 
@@ -373,7 +441,7 @@ def bench(device, preset, steps, batch):
 def main():
     global OUT
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", nargs="?", default="all", choices=["verify", "allreduce", "bench", "all"])
+    ap.add_argument("what", nargs="?", default="all", choices=["verify", "allreduce", "contention", "bench", "all"])
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--model", default="medium")
     ap.add_argument("--steps", type=int, default=12)
@@ -387,6 +455,8 @@ def main():
         verify(a.device)
     if a.what in ("allreduce", "all"):
         allreduce(a.device)
+    if a.what in ("contention", "all"):
+        contention(a.device)
     if a.what in ("bench", "all"):
         os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
         bench(a.device, a.model, a.steps, a.batch)

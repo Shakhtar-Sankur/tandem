@@ -101,3 +101,12 @@ def failing(g):
 def test_error_propagates():
     with pytest.raises(Exception, match="boom"):
         launch(failing, 2)
+
+
+def test_exposed_counts_only_running_communication():
+    from tandem.profile import summarize
+
+    # Waits 0-10 and 20-30; collectives run 5-12 and 25-40.
+    s = summarize([], [("a", 5, 12, 0), ("b", 25, 40, 0)], [("a", 0, 10), ("b", 20, 30)], 40)
+    assert s["comm_s"] == 22 and s["exposed_comm_s"] == 10
+    assert abs(s["overlap"] - (1 - 10 / 22)) < 1e-12

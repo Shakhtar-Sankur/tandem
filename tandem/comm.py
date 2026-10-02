@@ -1,10 +1,16 @@
 """Collectives between processes on one machine, without torch.distributed or NCCL.
 
 Each ordered pair of ranks (src, dst) has a mailbox: `slots` buffers of
-`slot_bytes` each, allocated by src (in shared memory for CPU ranks, or on
-src's GPU and shared through CUDA IPC), and two counting semaphores: pieces
+`slot_bytes` each, allocated by src, and two counting semaphores: pieces
 waiting to be read, and slots free to write. A message larger than a slot
-travels as a sequence of pieces.
+travels as a sequence of pieces. Where the buffers live is the transport:
+
+  CPU ranks          shared memory.
+  GPU, "device"      on src's GPU, shared through CUDA IPC; dst copies
+                     each piece straight from src's GPU.
+  GPU, "host"        pinned shared host memory, as NCCL's shared-memory
+                     transport: src copies GPU to host, dst host to GPU, and
+                     no process ever queues work on another's GPU.
 
   put (src):  take a free slot, copy the piece in, finish the copy (on a
               GPU, synchronize the stream), then signal a piece.
@@ -21,11 +27,14 @@ all-gather (so all-reduce), a pipelined broadcast, and point-to-point
 send/recv for pipeline parallelism.
 
 Every collective runs on one background thread per rank (and, on GPUs, on
-its own CUDA stream), in submission order, so ranks agree on the order of
-their collectives and the training thread can keep computing while
-gradients travel: `all_reduce(..., async_op=True)` returns a Work to wait on.
+its own CUDA stream, high priority by default as torch FSDP's are, so its
+small kernels are scheduled ahead of waiting compute), in submission order,
+so ranks agree on the order of their collectives and the training thread
+can keep computing while gradients travel: `all_reduce(..., async_op=True)`
+returns a Work to wait on.
 """
 
+import gc
 import math
 import os
 import queue
@@ -38,6 +47,8 @@ import torch.multiprocessing as mp
 DEFAULT_SLOT_BYTES = 4 << 20
 DEFAULT_SLOTS = 2
 DEFAULT_TIMEOUT = float(os.environ.get("TANDEM_TIMEOUT", "600"))
+DEFAULT_TRANSPORT = os.environ.get("TANDEM_TRANSPORT", "device")
+DEFAULT_PRIORITY = int(os.environ.get("TANDEM_PRIORITY", "-1"))  # lower is more urgent; 0 is normal
 
 
 class CommError(RuntimeError):
@@ -74,10 +85,15 @@ class Group:
     the thread that runs its collectives."""
 
     def __init__(self, rank, size, device, sync, queues, slot_bytes=DEFAULT_SLOT_BYTES,
-                 slots=DEFAULT_SLOTS, timeout=DEFAULT_TIMEOUT):
+                 slots=DEFAULT_SLOTS, timeout=DEFAULT_TIMEOUT, transport=None, priority=None):
         self.rank, self.size = rank, size
         self.device = torch.device(device)
         self.slot_bytes, self.slots, self.timeout = slot_bytes, slots, timeout
+        self.transport = transport or DEFAULT_TRANSPORT
+        self.priority = DEFAULT_PRIORITY if priority is None else priority
+        if self.transport not in ("device", "host"):
+            raise CommError(f"unknown transport {self.transport}")
+        self._pinned = []  # host buffers registered with CUDA
         self._full, self._free, self._barrier = sync
         self._queues = queues
         self.out = {}  # dst -> [slots, slot_bytes] uint8, ours
@@ -111,11 +127,13 @@ class Group:
             raise CommError(f"timed out after {self.timeout:.0f}s waiting for {what}")
 
     def _rendezvous(self):
+        on_host = self.device.type == "cpu" or self.transport == "host"
         for dst in range(self.size):
             if dst == self.rank:
                 continue
-            buf = torch.zeros(self.slots, self.slot_bytes, dtype=torch.uint8, device=self.device)
-            if buf.device.type == "cpu":
+            buf = torch.zeros(self.slots, self.slot_bytes, dtype=torch.uint8,
+                              device="cpu" if on_host else self.device)
+            if on_host:
                 buf.share_memory_()
             self.out[dst] = buf
             self._queues[dst].put((self.rank, buf))
@@ -124,12 +142,18 @@ class Group:
             self.inbox[src] = buf
         if self.device.type == "cuda":
             self._scratch = torch.empty(self.slot_bytes, dtype=torch.uint8, device=self.device)
+            if on_host:  # page-locked, so copies to and from it are asynchronous DMA
+                for buf in [*self.out.values(), *self.inbox.values()]:
+                    err = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), buf.numel(), 0)
+                    if int(err) != 0:
+                        raise CommError(f"cudaHostRegister failed: {err}")
+                    self._pinned.append(buf.data_ptr())
 
     # ---- the communication thread
     def _loop(self):
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
-            self._stream = torch.cuda.Stream(self.device)
+            self._stream = torch.cuda.Stream(self.device, priority=self.priority)
         while True:
             job = self._jobs.get()
             if job is None:
@@ -357,11 +381,18 @@ class Group:
         self.barrier()
 
         def release():
-            # Drop our handles on the other ranks' buffers before anyone
-            # exits, so no rank frees memory another still maps.
-            self.inbox.clear()
+            # Every rank drops the other ranks' buffers, then, once all have,
+            # frees its own: no rank frees memory another still maps.
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
+                for ptr in self._pinned:
+                    torch.cuda.cudart().cudaHostUnregister(ptr)
+                self._pinned.clear()
+            self.inbox.clear()
+            gc.collect()
+            self._barrier.wait(timeout=self.timeout)
+            self.out.clear()
+            if self.device.type == "cuda":
                 torch.cuda.ipc_collect()
 
         self.submit("release", release)
@@ -371,14 +402,14 @@ class Group:
         self._thread.join()
 
 
-def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, results):
+def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, transport, priority, results):
     if device == "cuda":
         torch.cuda.set_device(rank)
         dev = torch.device("cuda", rank)
     else:
         dev = torch.device("cpu")
         torch.set_num_threads(max(1, int(os.environ.get("TANDEM_CPU_THREADS", "1"))))
-    g = Group(rank, size, dev, sync, queues, slot_bytes, slots)
+    g = Group(rank, size, dev, sync, queues, slot_bytes, slots, transport=transport, priority=priority)
     try:
         out = fn(g, *args)
         g.close()
@@ -389,9 +420,12 @@ def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, resul
         torch.save(out, os.path.join(results, f"rank{rank}.pt"))
 
 
-def launch(fn, size, *args, device="cpu", slot_bytes=DEFAULT_SLOT_BYTES, slots=DEFAULT_SLOTS):
+def launch(fn, size, *args, device="cpu", slot_bytes=DEFAULT_SLOT_BYTES, slots=DEFAULT_SLOTS,
+           transport=None, priority=None):
     """Runs fn(group, *args) on `size` processes (one per GPU with
     device="cuda") and returns each rank's return value, in rank order.
+    transport ("device" or "host") and priority (the communication
+    stream's) only matter on GPUs.
     Return values travel back pickled, so keep them small (CPU tensors,
     numbers, lists)."""
     import tempfile
@@ -400,7 +434,7 @@ def launch(fn, size, *args, device="cpu", slot_bytes=DEFAULT_SLOT_BYTES, slots=D
     sync = Group.make_sync(ctx, size, slots)
     queues = [ctx.Queue() for _ in range(size)]
     with tempfile.TemporaryDirectory(prefix="tandem-") as results:
-        mp.spawn(_worker, args=(size, fn, args, sync, queues, device, slot_bytes, slots, results),
+        mp.spawn(_worker, args=(size, fn, args, sync, queues, device, slot_bytes, slots, transport, priority, results),
                  nprocs=size, join=True)
         out = []
         for r in range(size):
