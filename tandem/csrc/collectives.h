@@ -1,4 +1,5 @@
-// M2: the progress thread and the collectives, on CPU tensors.
+// M2: the progress thread and the collectives. M3: the same on GPUs (built
+// with TANDEM_CUDA), moving pieces through CudaLinks instead of host memory.
 //
 // An Engine is one rank's half of the group. It owns a Channel to every other
 // rank (created by this rank, named after the job and the pair) and opens the
@@ -9,6 +10,11 @@
 // The algorithms are the Python engine's (tandem/comm.py), step for step, and
 // the arithmetic is the same ATen calls (div_ before the sum, then add_ of each
 // received piece), so the two engines produce bit-identical results.
+//
+// On GPUs a collective is ordered by streams, as NCCL's are: it starts on the
+// engine's stream once the caller's current stream reaches the point where it
+// was submitted, and Work::wait() makes the caller's current stream wait for
+// it to finish, without blocking the host.
 #pragma once
 
 #include <ATen/ATen.h>
@@ -25,13 +31,21 @@
 #include <vector>
 
 #include "channel.h"
+#ifdef TANDEM_CUDA
+#include <cuda_runtime_api.h>
+
+#include "cuda_links.h"
+#endif
 
 namespace tandem {
 
 // A collective in flight.
 class Work {
  public:
-  void wait();  // blocks until done; rethrows what the collective threw
+  ~Work();
+  // Blocks until the collective has run (on GPUs: has been enqueued), then, on
+  // GPUs, makes the caller's current stream wait for it. Rethrows its error.
+  void wait();
   bool done() const;
   double started() const;   // seconds on the steady clock (CLOCK_MONOTONIC,
   double finished() const;  // the clock of Python's time.perf_counter)
@@ -40,6 +54,10 @@ class Work {
   friend class Engine;
   void finish(std::exception_ptr error, double t0, double t1);
 
+#ifdef TANDEM_CUDA
+  cudaEvent_t done_event_ = nullptr;  // recorded on the engine's stream after the collective
+  int device_ = -1;
+#endif
   mutable std::mutex mu_;
   std::condition_variable cv_;
   bool done_ = false;
@@ -49,9 +67,10 @@ class Work {
 
 class Engine {
  public:
-  // Creates this rank's outgoing channels. Call connect() once every rank has
-  // constructed its Engine.
-  Engine(const std::string& job, int rank, int size, std::size_t slots, std::size_t slot_bytes, double timeout_s);
+  // Creates this rank's outgoing channels (and, with device >= 0, its GPU
+  // slots and events). Call connect() once every rank has constructed its Engine.
+  Engine(const std::string& job, int rank, int size, std::size_t slots, std::size_t slot_bytes, double timeout_s,
+         int device = -1);
   void connect();  // opens the channels the other ranks created to this one
   void close();    // finishes the queued collectives and stops the thread
   ~Engine();
@@ -59,7 +78,7 @@ class Engine {
   Engine(const Engine&) = delete;
   Engine& operator=(const Engine&) = delete;
 
-  // Tensors must be contiguous CPU tensors; results are written in place.
+  // Tensors must be contiguous, on the engine's device; results are written in place.
   // sizes: how to cut the flat tensor into one chunk per rank (empty: as even
   // as possible, as torch.tensor_split does).
   std::shared_ptr<Work> all_reduce(at::Tensor t, bool average);
@@ -75,8 +94,10 @@ class Engine {
   int size() const { return size_; }
 
  private:
-  std::shared_ptr<Work> submit(std::function<void()> job);
+  std::shared_ptr<Work> submit(std::function<void()> job, std::vector<at::Tensor> tensors = {});
   void loop();
+  void barrier_now();
+  void check(const at::Tensor& t, const char* what) const;
 
   void put(int dst, const at::Tensor& piece);
   void take(int src, at::Tensor& piece, bool reduce);
@@ -91,12 +112,16 @@ class Engine {
   int rank_, size_;
   std::size_t slots_, slot_bytes_;
   double timeout_s_;
+  int device_;  // -1: CPU
   std::vector<Channel> out_, in_;  // indexed by peer rank; empty at our own rank
 
   std::mutex mu_;
   std::condition_variable cv_;
   std::deque<std::pair<std::function<void()>, std::shared_ptr<Work>>> jobs_;
   bool stopping_ = false;
+#ifdef TANDEM_CUDA
+  std::unique_ptr<CudaLinks> cuda_;
+#endif
   std::thread thread_;
 };
 

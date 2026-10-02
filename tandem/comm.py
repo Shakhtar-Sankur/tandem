@@ -147,13 +147,14 @@ class Group:
         self.barrier()
 
     def _start_engine(self, job):
-        if self.device.type != "cpu":
-            raise CommError("the C++ engine runs on CPU tensors so far (CUDA is milestone M3)")
         if job is None:
             raise CommError("the C++ engine needs a job name (launch() makes one)")
         from .engine import lib
 
-        self._engine = lib().Engine(job, self.rank, self.size, self.slots, self.slot_bytes, self.timeout)
+        device = self.device.index if self.device.type == "cuda" else -1
+        if device is not None and device >= 0 and not lib().cuda:
+            raise CommError("the C++ engine was built without CUDA (no GPU visible when it was compiled)")
+        self._engine = lib().Engine(job, self.rank, self.size, self.slots, self.slot_bytes, self.timeout, device)
         self._barrier.wait(timeout=self.timeout)  # every rank has created its outgoing channels
         self._engine.connect()
         self.barrier()
@@ -493,10 +494,11 @@ class Group:
 
 
 def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, transport, priority, backend, job,
-            results):
+            gpus, results):
     if device == "cuda":
-        torch.cuda.set_device(rank)
-        dev = torch.device("cuda", rank)
+        index = gpus[rank] if gpus else rank
+        torch.cuda.set_device(index)
+        dev = torch.device("cuda", index)
     else:
         dev = torch.device("cpu")
         torch.set_num_threads(max(1, int(os.environ.get("TANDEM_CPU_THREADS", "1"))))
@@ -513,12 +515,13 @@ def _worker(rank, size, fn, args, sync, queues, device, slot_bytes, slots, trans
 
 
 def launch(fn, size, *args, device="cpu", slot_bytes=DEFAULT_SLOT_BYTES, slots=DEFAULT_SLOTS,
-           transport=None, priority=None, backend=None):
+           transport=None, priority=None, backend=None, gpus=None):
     """Runs fn(group, *args) on `size` processes (one per GPU with
     device="cuda") and returns each rank's return value, in rank order.
     transport ("device" or "host") and priority (the communication
     stream's) only matter on GPUs. backend: "python" (default) or "cpp", the
-    C++ engine (or set TANDEM_BACKEND).
+    C++ engine (or set TANDEM_BACKEND). gpus: the GPU index for each rank
+    (default: rank r on GPU r); ranks may share a GPU.
     Return values travel back pickled, so keep them small (CPU tensors,
     numbers, lists)."""
     import tempfile
@@ -535,7 +538,7 @@ def launch(fn, size, *args, device="cpu", slot_bytes=DEFAULT_SLOT_BYTES, slots=D
     queues = [ctx.Queue() for _ in range(size)]
     with tempfile.TemporaryDirectory(prefix="tandem-") as results:
         mp.spawn(_worker, args=(size, fn, args, sync, queues, device, slot_bytes, slots, transport, priority,
-                                backend, job, results),
+                                backend, job, gpus, results),
                  nprocs=size, join=True)
         out = []
         for r in range(size):

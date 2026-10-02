@@ -7,11 +7,13 @@
   contention a 64 MB all-reduce alone and while the GPU runs matmuls, for
              each transport and stream priority: whether communication
              keeps its speed beside compute, which is what overlap needs.
+  engine     the C++ engine: the bit-for-bit checks on it, and its all-reduce
+             against the Python engine's and NCCL's (gloo's on CPU).
   bench      a larger GPT: step time, tokens/s and peak memory per GPU for
              each strategy, and how much of tandem DDP's communication
              hides behind backward. "ddp@host" is ddp over the host transport.
 
-usage: python bench/run.py [verify|allreduce|contention|bench|all] [--device cuda|cpu]
+usage: python bench/run.py [verify|allreduce|contention|engine|bench|all] [--device cuda|cpu]
        [--out results.jsonl]. Prints one JSON line per measurement.
 """
 
@@ -157,10 +159,13 @@ def tandem_rank(g, strategy, cfg, steps, batch, micro, deterministic, data, want
 
 
 def run_tandem(strategy, device, **kw):
+    """strategy[@transport][+cpp]: "ddp@host" uses the Python engine's host
+    transport, "zero3+cpp" the C++ engine."""
+    strategy, _, backend = strategy.partition("+")
     strategy, _, transport = strategy.partition("@")
     return launch(tandem_rank, 2, strategy, kw["cfg"], kw["steps"], kw["batch"], kw.get("micro", 4),
                   kw.get("deterministic", False), kw.get("data", "synthetic"), kw.get("want_weights", False),
-                  kw.get("profile", False), device=device, transport=transport or None)
+                  kw.get("profile", False), device=device, transport=transport or None, backend=backend or None)
 
 
 # ---------------------------------------------------------------- torch.distributed
@@ -331,16 +336,49 @@ def ar_torch(rank, init, out, device, sizes, reps):
     dist.destroy_process_group()
 
 
-def allreduce(device):
+def allreduce(device, backend=None):
     sizes, reps = [1, 4, 16, 64, 256], 10
-    ours = launch(ar_rank, 2, sizes, reps, device=device)[0]
+    ours = launch(ar_rank, 2, sizes, reps, device=device, backend=backend)[0]
     with tempfile.TemporaryDirectory() as d:
         mp.spawn(ar_torch, args=(os.path.join(d, "init"), os.path.join(d, "o"), device, sizes, reps), nprocs=2)
         ref = torch.load(os.path.join(d, "o.0"))
     base = "nccl" if device == "cuda" else "gloo"
     for mb in sizes:
-        emit({"section": "allreduce", "MB": mb, "tandem_ms": ours[mb] * 1e3, f"{base}_ms": ref[mb] * 1e3,
-              "tandem_GBps": mb / 1024 / ours[mb], f"{base}_GBps": mb / 1024 / ref[mb]})
+        row = {"section": "allreduce", "MB": mb, "tandem_ms": ours[mb] * 1e3, f"{base}_ms": ref[mb] * 1e3,
+               "tandem_GBps": mb / 1024 / ours[mb], f"{base}_GBps": mb / 1024 / ref[mb]}
+        if backend:
+            row["engine"] = backend
+        emit(row)
+
+
+def engine(device):
+    """The C++ engine against the Python engine and torch.distributed: the
+    bit-for-bit checks, all-reduce by size, and training step times."""
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    cfg = Config(seq=128, layers=4, heads=4, dim=256)
+    kw = dict(cfg=cfg, steps=20, batch=16, deterministic=True, want_weights=True)
+    ref = run_torch("torch-ddp", device, **kw)
+    for s in ("ddp", "zero1", "zero2", "zero3"):
+        try:
+            compare(s + "+cpp", run_tandem(s + "+cpp", device, **kw), ref, "torch-ddp")
+        except Exception as e:
+            emit({"section": "verify", "strategy": s + "+cpp", "error": repr(e)[:300]})
+    single = run_single(device, cfg, 20, 16, 4, deterministic=True)
+    for s in ("pp-gpipe+cpp", "pp-1f1b+cpp"):
+        try:
+            ours = run_tandem(s, device, micro=4, **kw)
+            both = torch.cat([ours[0]["weights"], ours[1]["weights"]])
+            emit({"section": "verify", "strategy": s, "against": "single-process accumulation",
+                  "losses_equal": ours[1]["losses"] == single["losses"],
+                  "weights_equal": torch.equal(both, single["weights"])})
+        except Exception as e:
+            emit({"section": "verify", "strategy": s, "error": repr(e)[:300]})
+    os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+    for backend in ("python", "cpp"):
+        try:
+            allreduce(device, backend)
+        except Exception as e:
+            emit({"section": "allreduce", "engine": backend, "error": repr(e)[:300]})
 
 
 def contention_rank(g, mb, reps, gemms):
@@ -430,10 +468,11 @@ def bench(device, preset, steps, batch):
     strategies = ["ddp", "ddp-nooverlap", "zero1", "zero2", "zero3", "pp-gpipe", "pp-1f1b"]
     if device == "cuda":
         strategies += ["ddp@host", "zero3@host"]
+    strategies += ["ddp+cpp", "zero3+cpp", "pp-1f1b+cpp"]
     for s in strategies:
         try:
             report(s, run_tandem(s, device, cfg=cfg, steps=steps, batch=batch, micro=4, data="shakespeare",
-                                 profile=s.split("@")[0] in ("ddp", "ddp-nooverlap", "zero3")))
+                                 profile=s.split("@")[0].split("+")[0] in ("ddp", "ddp-nooverlap", "zero3")))
         except Exception as e:
             emit({"section": "bench", "strategy": s, "error": repr(e)[:300]})
 
@@ -441,7 +480,7 @@ def bench(device, preset, steps, batch):
 def main():
     global OUT
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", nargs="?", default="all", choices=["verify", "allreduce", "contention", "bench", "all"])
+    ap.add_argument("what", nargs="?", default="all", choices=["verify", "allreduce", "contention", "engine", "bench", "all"])
     ap.add_argument("--device", choices=["cuda", "cpu"])
     ap.add_argument("--model", default="medium")
     ap.add_argument("--steps", type=int, default=12)
@@ -462,6 +501,8 @@ def main():
         allreduce(a.device)
     if a.what in ("contention", "all"):
         contention(a.device)
+    if a.what in ("engine", "all"):
+        engine(a.device)
     if a.what in ("bench", "all"):
         os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
         bench(a.device, a.model, a.steps, a.batch)

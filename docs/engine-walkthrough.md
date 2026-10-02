@@ -236,3 +236,80 @@ On CPU, large messages are limited by memory bandwidth whichever engine moves th
 C++ engine's gain is in per-message overhead, which is what dominates small messages, and
 what limited the Python engine on GPUs. M3 brings the engine to CUDA, where that overhead
 was measured.
+
+## 5. On GPUs (`cuda_links.h/.cpp`, `reduce.cu`): milestone M3
+
+*Compiled and checked here with nvcc and the CUDA headers; the GPU tests
+(`tests/test_engine_cuda.py`) and `python bench/run.py engine` run on a machine with GPUs.*
+
+**What changes on a GPU.** The data now lives in GPU memory, and GPU work is asynchronous:
+a CUDA call *enqueues* work on a **stream** (an ordered queue of GPU work) and returns at
+once. The Python engine waited on the host after every 4 MB piece
+(`stream.synchronize()`), and on two T4s its communication took 5× longer while the GPUs
+were busy with backward. The C++ engine never makes the host wait for a piece.
+
+**CUDA IPC: sharing GPU memory between processes.** `cudaIpcGetMemHandle` turns a
+`cudaMalloc` pointer into a 64-byte handle; another process passes it to
+`cudaIpcOpenMemHandle` and gets a pointer to the *same* GPU memory. Each rank allocates
+`slots` buffers per peer on its own GPU and publishes the handles in a small shared-memory
+region (`/tandem-<job>-<rank>-cuda`); `connect()` opens every peer's.
+
+**Interprocess events: ordering GPU work across processes.** An event is a marker in a
+stream; `cudaStreamWaitEvent(s, e)` makes stream `s` wait (on the GPU, not the host) until
+the GPU passes the most recent `cudaEventRecord(e, ...)`. Created with
+`cudaEventInterprocess`, an event can be shared like memory (`cudaIpcGetEventHandle`).
+Per slot there are two:
+
+- `full[j]`: the sender records it after copying a piece into slot `j`; the receiver's
+  stream waits on it before reading the slot.
+- `free[j]`: the receiver records it after reading slot `j`; the sender's stream waits on
+  it before overwriting the slot with a later piece.
+
+The Channel from M1 still runs between the hosts, but now carries only "the next piece is
+`n` bytes": the sender sends it right after *enqueuing* its copy and its `full` record.
+The receiver, on seeing the message, enqueues a wait on `full[j]`, its read, and its `free`
+record, then releases the message. Why this is safe: an event wait refers to the latest
+record *enqueued so far*, and each record is enqueued before the host message that lets the
+other side enqueue the wait. And the sender cannot reuse slot `j` until the Channel has room,
+which only happens after the receiver has released (and therefore already enqueued its
+`free[j]` record).
+
+**The fused reduce kernel (`reduce.cu`).** `dst[i] += src[i]`, where `src` can be the
+peer's slot on the *other* GPU, read directly over peer-to-peer access when the two GPUs
+support it (no copy first). If they do not, the piece is first copied into a local scratch
+buffer. For `float` it moves 16 bytes per thread at a time (`float4`). For `half` and
+`bfloat16` it adds in float and rounds once to nearest-even, exactly as ATen does, so
+results stay bit-identical.
+
+**Stream semantics, like NCCL.** A collective does not start when it is submitted, but
+when the *caller's* stream reaches the point of submission: `submit` records a "ready"
+event on the caller's current stream, and the engine's stream waits on it. `Work.wait()`
+does not block the host either: it makes the caller's current stream wait on the
+collective's "done" event. Code that follows on that stream (the optimizer step) runs
+after the gradients arrive, while the host is already free to queue more work.
+
+**Memory safety across streams.** PyTorch's caching allocator reuses a freed tensor's
+memory immediately for the *same* stream. If the caller frees a tensor while the engine's
+stream still reads it, the memory could be reused too early.
+`CUDACachingAllocator::recordStream(storage, engine_stream)` tells the allocator to wait
+for the engine's stream too.
+
+**High-priority stream.** The engine's stream is created with the device's greatest
+priority, so its small kernels are scheduled ahead of waiting compute kernels, as the
+streams of torch's FSDP are.
+
+**Shutting down.** No rank may free its slots while another might still read them, so
+`close()` waits for its own stream, then runs a barrier with every rank, and only then
+closes the IPC handles, destroys the events and frees the memory.
+
+**Interview questions**
+- *What is a CUDA stream, and why does async matter?* An in-order queue of GPU work; calls
+  return once work is enqueued, so the CPU can keep feeding the GPU instead of waiting.
+- *How do two processes share GPU memory and order their work?* CUDA IPC memory handles,
+  and interprocess events waited on with `cudaStreamWaitEvent`.
+- *What does `Work.wait()` do on a GPU?* Makes the caller's stream wait on an event; the
+  host does not block (NCCL's semantics).
+- *Why `recordStream`?* The caching allocator is per-stream; without it, memory still used
+  by another stream can be handed out again.
+- *How do you keep GPU results bit-identical to PyTorch?* Same operation order, and the
+  same precision rules: half and bfloat16 add in float and round once.

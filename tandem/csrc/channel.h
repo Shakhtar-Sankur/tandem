@@ -65,6 +65,10 @@ class Channel {
   std::pair<const void*, std::size_t> peek(double timeout_s);
   void release();
 
+  // Waits until send() would not block (a slot is free). Used by the GPU path,
+  // which must know a slot is free before it starts copying into it.
+  void wait_writable(double timeout_s);
+
   std::size_t slots() const noexcept;
   std::size_t slot_bytes() const noexcept;
 

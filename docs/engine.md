@@ -27,8 +27,10 @@ engine stays as the reference, and every test runs against both.
 
 **Status:** M0, M1 and M2 are done. The collective tests, DDP, ZeRO-1/2/3 and both
 pipeline schedules pass on the C++ engine, bit-identical to PyTorch, and on CPU it runs
-a 1 MB all-reduce 1.6 to 2.2 times faster than the Python engine. M3 (CUDA) and M4 (GPU
-measurements) are next. `docs/engine-walkthrough.md` explains the code.
+a 1 MB all-reduce 1.6 to 2.2 times faster than the Python engine. M3 (CUDA) is written and
+compiles (nvcc, sm_75); its GPU tests (`tests/test_engine_cuda.py`) and measurements
+(`python bench/run.py engine`) are waiting for a run on GPUs. M4 is the write-up of those.
+`docs/engine-walkthrough.md` explains the code.
 
 ## Milestones
 

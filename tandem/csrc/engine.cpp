@@ -1,5 +1,6 @@
 // Python bindings for the engine (tandem.engine.lib()). The engine itself is in
-// shm.cpp, channel.cpp and collectives.cpp; this file only exposes it.
+// shm.cpp, channel.cpp, collectives.cpp and, on GPUs, cuda_links.cpp and
+// reduce.cu; this file only exposes it.
 
 #include <torch/extension.h>
 
@@ -73,6 +74,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("close", [](SharedMemory& s) { SharedMemory gone(std::move(s)); });
 
   m.def("_move_check", &move_check);
+#ifdef TANDEM_CUDA
+  m.attr("cuda") = true;
+#else
+  m.attr("cuda") = false;
+#endif
 
   py::class_<Channel>(m, "Channel")
       .def_static("create", &Channel::create, py::arg("name"), py::arg("slots"), py::arg("slot_bytes"))
@@ -101,8 +107,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly("finished", &Work::finished);
 
   py::class_<Engine>(m, "Engine")
-      .def(py::init<const std::string&, int, int, std::size_t, std::size_t, double>(), py::arg("job"),
-           py::arg("rank"), py::arg("size"), py::arg("slots"), py::arg("slot_bytes"), py::arg("timeout"))
+      .def(py::init<const std::string&, int, int, std::size_t, std::size_t, double, int>(), py::arg("job"),
+           py::arg("rank"), py::arg("size"), py::arg("slots"), py::arg("slot_bytes"), py::arg("timeout"),
+           py::arg("device") = -1)
       .def("connect", &Engine::connect, py::call_guard<py::gil_scoped_release>())
       .def("close", &Engine::close, py::call_guard<py::gil_scoped_release>())
       .def("all_reduce", &Engine::all_reduce, py::arg("t"), py::arg("average"))

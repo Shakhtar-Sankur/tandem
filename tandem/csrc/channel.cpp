@@ -97,6 +97,13 @@ void Channel::send(const void* data, std::size_t n, double timeout_s) {
   h->head.store(head + 1, std::memory_order_release);
 }
 
+void Channel::wait_writable(double timeout_s) {
+  Header* h = header(shm_);
+  const std::uint64_t head = h->head.load(std::memory_order_relaxed);
+  wait_until([&] { return head - h->tail.load(std::memory_order_acquire) < h->slots; }, timeout_s,
+             "send: the channel stayed full");
+}
+
 std::pair<const void*, std::size_t> Channel::peek(double timeout_s) {
   Header* h = header(shm_);
   const std::uint64_t tail = h->tail.load(std::memory_order_relaxed);
