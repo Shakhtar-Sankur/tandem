@@ -30,8 +30,9 @@ pipeline schedules pass on the C++ engine, bit-identical to PyTorch, and on CPU 
 a 1 MB all-reduce 1.6 to 2.2 times faster than the Python engine. M3 (CUDA) passes its GPU
 tests on a T4 (`tests/test_engine_cuda.py`, Colab, two ranks sharing the GPU through CUDA
 IPC): every collective in float32, float16, bfloat16 and int64 at 2 and 3 ranks, and DDP
-training bit-identical to the Python engine. Its speed on one GPU:
-`python bench/engine_one_gpu.py`; against NCCL on two GPUs: `python bench/run.py engine`.
+training bit-identical to the Python engine. On one T4 its all-reduce is
+1.6 to 2.8 times faster than the Python engine's, 64 KB to 64 MB (`python bench/engine_one_gpu.py`;
+results in the README). Against NCCL on two GPUs: `python bench/run.py engine`, still to be run.
 `docs/engine-walkthrough.md` explains the code.
 
 ## Milestones

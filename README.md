@@ -77,6 +77,35 @@ What the table shows:
   high-priority stream, or staging through pinned host memory as NCCL's shared-memory
   transport does, keeps communication at full speed beside compute.
 
+## The C++ engine
+
+`Group(backend="cpp")` runs the same collectives in a C++ extension instead of Python
+([design](docs/engine.md), [explained line by line](docs/engine-walkthrough.md)):
+lock-free single-producer, single-consumer rings in shared memory, a progress thread, and
+on GPUs CUDA IPC buffers ordered by interprocess events, with a fused reduce kernel, so
+the host never waits for a piece. Results are bit-identical to the Python engine's: the
+whole test suite and the bit-for-bit training checks pass on it (CPU in CI; on a T4,
+`tests/test_engine_cuda.py`).
+
+All-reduce of float32 on one Tesla T4 (Colab, torch 2.11), two ranks sharing the GPU
+through CUDA IPC, median of 20 ([raw](bench/t4/engine-one-gpu-2026-10-02.jsonl),
+`python bench/engine_one_gpu.py`):
+
+| size | Python engine | C++ engine | speedup |
+|---|---|---|---|
+| 64 KB | 1.79 ms | 0.64 ms | 2.8× |
+| 256 KB | 1.49 ms | 0.80 ms | 1.9× |
+| 1 MB | 1.53 ms | 0.83 ms | 1.9× |
+| 4 MB | 1.65 ms | 0.75 ms | 2.2× |
+| 16 MB | 3.27 ms | 1.72 ms | 1.9× |
+| 64 MB | 10.00 ms | 6.24 ms | 1.6× |
+
+Two ranks on one GPU measure the engines' own overhead, not the link between GPUs (NCCL
+cannot run two ranks on one GPU, so it is not in this table). On two GPUs,
+`python bench/run.py engine` compares all three; those numbers are still to be measured.
+On CPU processes the C++ engine is 1.6 to 2.2× faster at 1 MB and level from 4 MB, where
+memory bandwidth limits both.
+
 ## Run it
 
 ```sh

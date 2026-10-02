@@ -1,0 +1,7 @@
+{"gpu": "Tesla T4", "torch": "2.11.0+cu130"}
+{"size_KB": 64, "python_ms": 1.785, "cpp_ms": 0.638, "speedup": 2.8}
+{"size_KB": 256, "python_ms": 1.494, "cpp_ms": 0.799, "speedup": 1.87}
+{"size_KB": 1024, "python_ms": 1.534, "cpp_ms": 0.827, "speedup": 1.85}
+{"size_KB": 4096, "python_ms": 1.648, "cpp_ms": 0.749, "speedup": 2.2}
+{"size_KB": 16384, "python_ms": 3.274, "cpp_ms": 1.72, "speedup": 1.9}
+{"size_KB": 65536, "python_ms": 9.996, "cpp_ms": 6.243, "speedup": 1.6}
