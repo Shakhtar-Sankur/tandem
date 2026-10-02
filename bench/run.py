@@ -442,13 +442,18 @@ def main():
     global OUT
     ap = argparse.ArgumentParser()
     ap.add_argument("what", nargs="?", default="all", choices=["verify", "allreduce", "contention", "bench", "all"])
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", choices=["cuda", "cpu"])
     ap.add_argument("--model", default="medium")
     ap.add_argument("--steps", type=int, default=12)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", default="results.jsonl")
     a = ap.parse_args()
     OUT = a.out
+    if a.device is None:
+        if not torch.cuda.is_available():
+            sys.exit("no GPU found. On Kaggle: Settings -> Accelerator -> 'GPU T4 x2', then run again. "
+                     "To run on CPU processes anyway (slow for the bench section): --device cpu")
+        a.device = "cuda"
     if a.device == "cuda" and torch.cuda.device_count() < 2:
         sys.exit(f"needs 2 GPUs, found {torch.cuda.device_count()} (Kaggle: Accelerator 'GPU T4 x2')")
     if a.what in ("verify", "all"):
