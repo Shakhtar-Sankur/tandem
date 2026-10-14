@@ -131,3 +131,7 @@ bench/run.py        verification and benchmarks against torch.distributed
 tandem/csrc/        the C++ engine (Group(backend="cpp")): docs/engine.md, docs/engine-walkthrough.md
 tandem/engine.py    builds and loads it
 ```
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
